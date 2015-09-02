@@ -1,4 +1,4 @@
-package com.dianping.trek.spi;
+package com.dianping.trek.processor;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -10,10 +10,14 @@ import org.apache.log4j.Level;
 import org.apache.log4j.Logger;
 import org.apache.log4j.spi.LoggingEvent;
 
+import com.dianping.trek.server.Application;
 import com.dianping.trek.server.MessageChunk;
 
-public abstract class BasicProcessor {
-    private static Log LOG = LogFactory.getLog(BasicProcessor.class);
+public abstract class AbstractProcessor {
+    private static Log LOG = LogFactory.getLog(AbstractProcessor.class);
+    private final int NEWLINE = '\n';
+    private final int RETURN = '\r';
+    
     private Application app;
     Category category;
     private String fqnOfCategoryClass;
@@ -22,7 +26,7 @@ public abstract class BasicProcessor {
         if (this.app == null) {
             this.app = app;
             this.fqnOfCategoryClass = Logger.class.getName();
-            this.category = Logger.getLogger(app.getAppName());
+            this.category = Logger.getLogger(app.getAlias());
         }
     }
     
@@ -37,7 +41,7 @@ public abstract class BasicProcessor {
         List<String> processedList = new ArrayList<String>(unProcessedList.size());
         for (String unProcessedLine : unProcessedList) {
             try {
-                processedList.add(processOneLine(unProcessedLine));
+                processedList.add(processOneLine(trimCRNL(unProcessedLine)));
             } catch (Exception e) {
                 LOG.error("Exception cached when processing one line, drop it", e);
             }
@@ -68,5 +72,16 @@ public abstract class BasicProcessor {
             );
             }
         }
+        LOG.trace("DIK: " + processedChunk.getResult().hashCode() + " " + System.currentTimeMillis());
+    }
+    
+    public String trimCRNL(String line) {
+        if (line.charAt(line.length() - 1) == NEWLINE) {
+            if (line.charAt(line.length() - 2) == RETURN) {
+                return line.substring(0, line.length() - 2);
+            }
+            return line.substring(0, line.length() - 1);
+        }
+        return line;
     }
 }

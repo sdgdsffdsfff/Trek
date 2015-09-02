@@ -1,5 +1,8 @@
 package com.dianping.trek.server;
 
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Properties;
 
 import org.apache.commons.logging.Log;
@@ -10,8 +13,8 @@ import org.json.JSONObject;
 
 import com.dianping.trek.decoder.WUPDecoder;
 import com.dianping.trek.handler.ApplicationDistributionHandler;
-import com.dianping.trek.spi.BasicProcessor;
-import com.dianping.trek.spi.TrekContext;
+import com.dianping.trek.metric.MetricReporter;
+import com.dianping.trek.processor.AbstractProcessor;
 import com.dianping.trek.util.CommonUtil;
 import com.dianping.trek.util.Constants;
 
@@ -25,18 +28,18 @@ import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.codec.bytes.ByteArrayEncoder;
 
-public class TrekServer {
+public class TrekServer extends Thread {
     private static Log LOG = LogFactory.getLog(TrekServer.class);
     private int port;
     private WorkerThreadManager workerManger;
+    private MetricReporter metricReporter;
 
-    public TrekServer(int port) {
-        this.port = port;
-    }
-    
-    public void run() throws Exception {
+    public void run() {
+        LOG.info("Start trek server on port " + port);
         workerManger = new WorkerThreadManager();
         workerManger.startAll();
+        metricReporter = new MetricReporter();
+        metricReporter.start();
         
         EventLoopGroup bossGroup = new NioEventLoopGroup();
         EventLoopGroup workerGroup = new NioEventLoopGroup();
@@ -46,6 +49,7 @@ public class TrekServer {
              .channel(NioServerSocketChannel.class)
              .childHandler(new FilterChannelChain())
              .option(ChannelOption.SO_BACKLOG, 128)
+             .option(ChannelOption.SO_KEEPALIVE, true)
              .childOption(ChannelOption.SO_KEEPALIVE, false);
 
             // Bind and start to accept incoming connections.
@@ -55,6 +59,8 @@ public class TrekServer {
             // In this example, this does not happen, but you can do that to gracefully
             // shut down your server.
             f.channel().closeFuture().sync();
+        } catch (InterruptedException e) {
+            LOG.error("netty loop interrupted", e);
         } finally {
             workerGroup.shutdownGracefully();
             bossGroup.shutdownGracefully();
@@ -71,45 +77,60 @@ public class TrekServer {
         }
     }
 
-    public static void main(String[] args) throws Exception {
+    public void initParam() throws IOException, ClassNotFoundException {
         Properties prop = new Properties();
         prop.load(TrekServer.class.getClassLoader().getResourceAsStream("config.properties"));
-        int port;
-        if (args.length > 0) {
-            port = Integer.parseInt(args[0]);
-        } else {
-            port = Integer.parseInt(prop.getProperty("trek.port", "8080"));
-        }
-        String basePath = prop.getProperty("trek.basePath", "/tmp");
-        TrekContext.SetDefaultLogBaseDir(basePath);
-        String appJsonStr = prop.getProperty("trek.app.json");
+        this.port = Integer.parseInt(prop.getProperty("trek.port", "8090"));
         
+        String basePath = prop.getProperty("trek.basePath", "/tmp");
+        TrekContext.getInstance().setDefaultLogBaseDir(basePath);
+        
+        String encryKey = prop.getProperty("trek.encryKey");
+        if (encryKey == null) {
+            throw new IOException("Can not find encry key");
+        }
+        TrekContext.getInstance().setEncryKey(encryKey);
+        
+        String appJsonStr = prop.getProperty("trek.app.json");
         if (appJsonStr != null) {
             JSONArray appArray = new JSONArray(appJsonStr);
             for (int i = 0; i < appArray.length(); i++) {
                 JSONObject appObject;
-                String name;
+                String alias;
+                JSONArray lognameArray;
                 String key;
+                List<String> lognames;
                 try {
                     appObject = appArray.getJSONObject(i);
-                    name = appObject.getString(Constants.APPNAME_KEY);
+                    alias = appObject.getString(Constants.ALIAS_KEY);
                     key = appObject.getString(Constants.APPKEY_KEY);
+                    lognameArray = appObject.getJSONArray(Constants.LOGNAMES_KEY);
+                    lognames = new ArrayList<String>();
+                    for (int j = 0; j < lognameArray.length(); j++) {
+                        lognames.add(lognameArray.getString(j));
+                    }
                 } catch (JSONException e) {
+                    LOG.warn("find invalid json", e);
                     continue;
                 }
-                boolean immediateFlush = CommonUtil.getBoolean(appObject, Constants.IMMEDIATE_FLUSH, false);
-                try {
-                    String processorClassName = CommonUtil.getString(appObject, Constants.PROCESS_CLASS_KEY, Constants.DEFAULT_PROCESSOR_CLASS);
-                    @SuppressWarnings("unchecked")
-                    Class<? extends BasicProcessor> processorClass = (Class<? extends BasicProcessor>) Class.forName(processorClassName);
-                    int numWorker = CommonUtil.getInteger(appObject, Constants.NUM_WORKER_KEY, Constants.DEFAULT_WORKER_NUMBER);
-                    TrekContext.INSTANCE.addApplication(name, key, processorClass, numWorker, immediateFlush);
-                } catch (Exception e) {
-                    LOG.error("Stop trek server cause fail to load processor", e);
-                    System.exit(1);
+                //bind vary logname to one key
+                for (String logname : lognames) {
+                    TrekContext.getInstance().setLognameMapping(logname, key);
                 }
+                int numWorker = CommonUtil.getInteger(appObject, Constants.NUM_WORKER_KEY, Constants.DEFAULT_WORKER_NUMBER);
+                boolean immediateFlush = CommonUtil.getBoolean(appObject, Constants.IMMEDIATE_FLUSH, false);
+                int flushBufferSize = CommonUtil.getInteger(appObject, Constants.FLUSH_BUFFER_SIZE_KEY, Constants.DEFAULT_FLUSH_BUFFER_SIZE);
+                String processorClassName = CommonUtil.getString(appObject, Constants.PROCESS_CLASS_KEY, Constants.DEFAULT_PROCESSOR_CLASS);
+                @SuppressWarnings("unchecked")
+                Class<? extends AbstractProcessor> processorClass = (Class<? extends AbstractProcessor>) Class.forName(processorClassName);
+                TrekContext.getInstance().addApplication(alias, key, processorClass, basePath,  numWorker, immediateFlush, flushBufferSize);
             }
         }
-        new TrekServer(port).run();
+    }
+    
+    public static void main(String[] args) throws Exception {
+        TrekServer server = new TrekServer();
+        server.initParam();
+        server.run();
     }
 }

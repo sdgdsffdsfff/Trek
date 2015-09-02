@@ -1,5 +1,6 @@
 package com.dianping.trek.server;
 
+import java.util.Arrays;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -8,9 +9,7 @@ import java.util.concurrent.CopyOnWriteArraySet;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 
-import com.dianping.trek.spi.Application;
-import com.dianping.trek.spi.BasicProcessor;
-import com.dianping.trek.spi.TrekContext;
+import com.dianping.trek.processor.AbstractProcessor;
 
 public class WorkerThreadManager {
     private static Log LOG = LogFactory.getLog(WorkerThreadManager.class);
@@ -20,36 +19,36 @@ public class WorkerThreadManager {
     private ConcurrentHashMap<String, Set<Worker>> runningWorkers;
     
     public WorkerThreadManager() {
-        this.trekContext = TrekContext.INSTANCE;
+        this.trekContext = TrekContext.getInstance();
         this.runningWorkers = new ConcurrentHashMap<String, Set<Worker>>();
     }
     
     public void startAll() {
-        Set<String> applications = trekContext.getAllApplicationNames();
-        for (String appName : applications) {
-            if (runningWorkers.containsKey(appName)) {
+        Set<String> appkeys = trekContext.getAllAppkeys();
+        for (String appkey : appkeys) {
+            if (runningWorkers.containsKey(appkey)) {
                 continue;
             }
-            Application app = trekContext.getApplication(appName);
+            Application app = trekContext.getApplication(appkey);
             BlockingQueue<MessageChunk> queue = app.getMessageQueue();
-            BasicProcessor processor = app.getProcessor();
+            AbstractProcessor processor = app.getProcessor();
             processor.setApp(app);
             int numWorker = app.getNumWorker();
             Set<Worker> workers = new CopyOnWriteArraySet<Worker>();
             for (int i = 0; i < numWorker; i++) {
-                Worker worker = new Worker(appName, queue, processor);
+                Worker worker = new Worker(app.getAlias(), queue, processor);
                 worker.setDaemon(true);
-                worker.setName(appName + "-" + i); 
+                worker.setName(app.getAlias() + "-" + i); 
                 worker.start();
                 workers.add(worker);
             }
-            runningWorkers.putIfAbsent(appName, workers);
+            runningWorkers.putIfAbsent(appkey, workers);
         }
     }
     
-    public void shutdown(String appName) {
+    public void shutdown(String appkey) {
         Set<Worker> workers = null;
-        if ((workers = runningWorkers.get(appName)) == null) {
+        if ((workers = runningWorkers.get(appkey)) == null) {
             return;
         } else {
             LOG.info("stopping work thread.");
@@ -58,18 +57,18 @@ public class WorkerThreadManager {
             }
             workers.clear();
         }
-        runningWorkers.remove(appName);
+        runningWorkers.remove(appkey);
     }
     
     class Worker extends Thread {
 
         private volatile boolean running;
-        private String  appName;
+        private String  alias;
         private BlockingQueue<MessageChunk> queue;
-        private BasicProcessor processor;
-        public Worker(String appName, BlockingQueue<MessageChunk> queue, BasicProcessor processor) {
+        private AbstractProcessor processor;
+        public Worker(String alias, BlockingQueue<MessageChunk> queue, AbstractProcessor processor) {
             this.running = true;
-            this.appName = appName;
+            this.alias = alias;
             this.queue = queue;
             this.processor = processor;
         }
@@ -81,7 +80,7 @@ public class WorkerThreadManager {
                     MessageChunk unprocessedChunk = queue.take();
                     processAndAck(unprocessedChunk, processor);
                 } catch (InterruptedException e) {
-                    LOG.error("Custom handler thread " + appName + " interrupted", e);
+                    LOG.error("Custom handler thread " + alias + " interrupted", e);
                     running = false;
                 } catch (Throwable t) {
                     LOG.error("Oops, worker got an exception!", t);
@@ -92,13 +91,15 @@ public class WorkerThreadManager {
             }
         }
 
-        private void processAndAck(MessageChunk unprocessedChunk, BasicProcessor processor) {
+        private void processAndAck(MessageChunk unprocessedChunk, AbstractProcessor processor) {
             MessageChunk processedChunk = processor.processOneChunk(unprocessedChunk);
             processor.logToDisk(processedChunk);
-            processedChunk.clearUnprocessedMessage();
             if (processedChunk.getResult().isNeedBackMsg()) {
-                processedChunk.getCtx().writeAndFlush(processedChunk.getResult().getReturnData());
+                byte[] src = processedChunk.getResult().getReturnData();
+                byte[] ack = Arrays.copyOf(src, src.length);
+                processedChunk.getCtx().writeAndFlush(ack);
             }
+            LOG.trace("ACK: " + unprocessedChunk.getResult().hashCode() + " " + System.currentTimeMillis());
         }
         
         public void stopGracefully() {
